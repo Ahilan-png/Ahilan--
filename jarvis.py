@@ -9,6 +9,7 @@ Features:
 - Answer questions using wikipedia; fallback to google search and fetch first page snippet
 - Basic OS control commands (open app/folder, shutdown/restart with confirmation, take screenshot, capture photo)
 - Buttons to start/stop camera and listening
+- Wakeword support ("Hey Jarvis") for voice commands; typed commands may include wakeword and it will be stripped
 """
 
 import threading
@@ -19,6 +20,7 @@ import subprocess
 import os
 import sys
 from datetime import datetime
+import re
 
 import cv2
 from PIL import Image, ImageTk
@@ -44,6 +46,7 @@ except Exception:
 CAMERA_INDEX = 0  # default camera
 WIKI_SENTENCES = 2
 ENGINE_RATE = 170
+WAKEWORD = "hey jarvis"  # wakeword (lowercase)
 # -----------------------------------
 
 # Initialize TTS engine
@@ -82,6 +85,28 @@ def listen(timeout=5, phrase_time_limit=8):
             return None
         except sr.RequestError:
             return None
+
+# ---------- Wakeword helpers ----------
+def normalize_text(t: str) -> str:
+    return re.sub(r"[^\w\s]", "", t).lower().strip()
+
+def has_wakeword(t: str) -> bool:
+    """Return True if the wakeword appears at the start or is spoken addressed in the text."""
+    if not t:
+        return False
+    norm = normalize_text(t)
+    # allow "hey jarvis" at start or maybe "jarvis" alone as target
+    return norm.startswith(WAKEWORD) or norm.startswith("jarvis")
+
+def strip_wakeword(t: str) -> str:
+    """Remove wakeword/prefix like 'hey jarvis' or 'jarvis' from the beginning of text."""
+    if not t:
+        return t
+    norm = t.strip()
+    # remove common punctuation and lowercase-check for wakeword forms
+    # Use regex to remove leading 'hey', optional comma, then 'jarvis'
+    stripped = re.sub(r'^\s*(hey[,]*\s+)?jarvis[,:\s-]*', '', norm, flags=re.I).strip()
+    return stripped if stripped else ""
 
 # ---------- Search Helpers ----------
 def search_wikipedia(query):
@@ -264,8 +289,14 @@ class JarvisApp:
         self.quit_btn = ttk.Button(camcontrols, text="Quit", command=self.on_quit)
         self.quit_btn.grid(row=0, column=2, padx=4)
 
+        # Wakeword / status label
+        status_frame = ttk.Frame(root)
+        status_frame.grid(row=3, column=0, padx=8, pady=(0,4), sticky="ew")
+        self.wake_label = ttk.Label(status_frame, text="Not listening")
+        self.wake_label.pack(side="left", padx=4)
+
         self.log = tk.Text(root, height=10, state="disabled")
-        self.log.grid(row=3, column=0, padx=8, pady=8, sticky="ew")
+        self.log.grid(row=4, column=0, padx=8, pady=8, sticky="ew")
 
         # camera variables
         self.cap = None
@@ -352,21 +383,47 @@ class JarvisApp:
         if not self.listening:
             self.listening = True
             self.listen_btn.config(text="Stop Listening")
+            self.wake_label.config(text=f"Listening (awaiting: \"{WAKEWORD}\")")
             self.listen_thread = threading.Thread(target=self._listening_loop, daemon=True)
             self.listen_thread.start()
             self.log_message("Listening started.")
+            speak(f"Listening. Say {WAKEWORD} followed by your command.")
         else:
             self.listening = False
             self.listen_btn.config(text="Start Listening")
+            self.wake_label.config(text="Not listening")
             self.log_message("Listening stopped.")
+            speak("Stopped listening.")
 
     def _listening_loop(self):
-        speak("I am listening.")
+        # When listening, act only on utterances that include the wakeword (or start addressing "jarvis")
         while self.listening:
             txt = listen(timeout=6, phrase_time_limit=6)
             if txt:
-                self.log_message(f"Voice: {txt}")
-                self.process_command(txt)
+                self.log_message(f"Voice raw: {txt}")
+                if has_wakeword(txt):
+                    # strip wakeword and process
+                    command_text = strip_wakeword(txt)
+                    if not command_text:
+                        # the user just said "Hey Jarvis" — prompt briefly
+                        self.log_message("Wakeword detected but no command followed.")
+                        speak("Yes?")
+                        # small pause to allow follow-up (could be improved into a two-stage listen)
+                        time.sleep(0.6)
+                        # try a short follow-up listen
+                        follow = listen(timeout=3, phrase_time_limit=4)
+                        if follow:
+                            self.log_message(f"Follow-up voice: {follow}")
+                            self.process_command(follow)
+                        continue
+                    self.log_message(f"Wakeword detected. Command: {command_text}")
+                    self.wake_label.config(text="Processing command...")
+                    speak("Processing your command.")
+                    self.process_command(command_text)
+                    self.wake_label.config(text=f"Listening (awaiting: \"{WAKEWORD}\")")
+                else:
+                    # ignore unrelated speech
+                    self.log_message("No wakeword detected in speech; ignoring.")
             else:
                 # small pause to avoid loop spin
                 time.sleep(0.5)
@@ -376,16 +433,23 @@ class JarvisApp:
         if not txt:
             return
         self.entry.delete(0, "end")
+        # strip wakeword from typed commands if present
+        if has_wakeword(txt):
+            txt = strip_wakeword(txt) or txt
         self.log_message(f"Command: {txt}")
         self.process_command(txt)
 
     def process_command(self, text):
+        text = (text or "").strip()
+        if not text:
+            return
         text_lower = text.lower().strip()
 
         # OS control commands
         if text_lower.startswith("open folder") or text_lower.startswith("open directory"):
             # expect: open folder C:\path or open folder documents
-            path = text.split(" ", 2)[2] if len(text.split(" ", 2)) >= 3 else os.path.expanduser("~")
+            parts = text.split(" ", 2)
+            path = parts[2] if len(parts) >= 3 else os.path.expanduser("~")
             ok, msg = open_folder(path)
             if ok:
                 self.log_message(f"Opened folder: {path}")
